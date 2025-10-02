@@ -23,8 +23,7 @@
           (while key-value)
           (for key = (car key-value))
           (for value = (cdr key-value))
-          (setf (gethash key data) value)
-          (format t "~A, ~a, ~a~%" key-value key value))))))
+          (setf (gethash key data) value))))))
 
 (defmethod conskivi-save ((database conskivi-inmemory-database))
   (bind (((:slots data data-lock db-path) database))
