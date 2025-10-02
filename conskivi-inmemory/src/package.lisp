@@ -7,4 +7,6 @@
    #:iterate
    #:metabang-bind)
   (:export 
-   #:conskivi-inmemory-database))
+   #:conskivi-inmemory-database
+   #:conskivi-load
+   #:conskivi-save))
