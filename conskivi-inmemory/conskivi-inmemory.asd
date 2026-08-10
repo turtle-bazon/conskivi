@@ -9,7 +9,8 @@
   :depends-on (bordeaux-threads
                conskivi-core
                iterate
-               metabang-bind)
+               metabang-bind
+               cl-ppcre)
   :components ((:module "src"
                 :components
                 ((:file "package")
@@ -18,5 +19,5 @@
   :in-order-to ((test-op (test-op conskivi-inmemory-tests)))
   :perform (test-op :after (op c)
                     (funcall
-                     (intern (symbol-name '#:conskivi-inmemory-tests)
+                     (intern (symbol-name '#:conskivi-run-all-tests)
                              :conskivi-inmemory-tests))))
