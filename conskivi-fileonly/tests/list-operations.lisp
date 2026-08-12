@@ -1,0 +1,76 @@
+;;; -*- lisp -*-
+
+(in-package :conskivi-fileonly-tests)
+
+(def-test list-lpush (:suite list-operations)
+  (with-fixture test-database ()
+    (let ((len (conskivi-lpush db :key1 "a" "b" "c")))
+      (is (= len 3))
+      (is (equal (conskivi-get db :key1) '("c" "b" "a"))))))
+
+(def-test list-rpush (:suite list-operations)
+  (with-fixture test-database ()
+    (let ((len (conskivi-rpush db :key1 "a" "b" "c")))
+      (is (= len 3))
+      (is (equal (conskivi-get db :key1) '("a" "b" "c"))))))
+
+(def-test list-lpop (:suite list-operations)
+  (with-fixture test-database ()
+    (conskivi-rpush db :key1 "a" "b" "c")
+    (let ((value (conskivi-lpop db :key1)))
+      (is (equal value "a"))
+      (is (equal (conskivi-get db :key1) '("b" "c"))))))
+
+(def-test list-rpop (:suite list-operations)
+  (with-fixture test-database ()
+    (conskivi-rpush db :key1 "a" "b" "c")
+    (let ((value (conskivi-rpop db :key1)))
+      (is (equal value "c"))
+      (is (equal (conskivi-get db :key1) '("a" "b"))))))
+
+(def-test list-lpop-empty (:suite list-operations)
+  (with-fixture test-database ()
+    (is (null (conskivi-lpop db :nonexistent)))))
+
+(def-test list-rpop-empty (:suite list-operations)
+  (with-fixture test-database ()
+    (is (null (conskivi-rpop db :nonexistent)))))
+
+(def-test list-lrange (:suite list-operations)
+  (with-fixture test-database ()
+    (conskivi-rpush db :key1 "a" "b" "c" "d" "e")
+    (let ((range (conskivi-lrange db :key1 1 3)))
+      (is (equal range '("b" "c" "d"))))))
+
+(def-test list-lrange-negative (:suite list-operations)
+  (with-fixture test-database ()
+    (conskivi-rpush db :key1 "a" "b" "c" "d" "e")
+    (let ((range (conskivi-lrange db :key1 -3 -1)))
+      (is (equal range '("c" "d" "e"))))))
+
+(def-test list-llen (:suite list-operations)
+  (with-fixture test-database ()
+    (conskivi-rpush db :key1 "a" "b" "c")
+    (is (= (conskivi-llen db :key1) 3))
+    (is (= (conskivi-llen db :nonexistent) 0))))
+
+(def-test list-lindex (:suite list-operations)
+  (with-fixture test-database ()
+    (conskivi-rpush db :key1 "a" "b" "c")
+    (is (equal (conskivi-lindex db :key1 0) "a"))
+    (is (equal (conskivi-lindex db :key1 1) "b"))
+    (is (equal (conskivi-lindex db :key1 -1) "c"))))
+
+(def-test list-lset (:suite list-operations)
+  (with-fixture test-database ()
+    (conskivi-rpush db :key1 "a" "b" "c")
+    (conskivi-lset db :key1 1 "x")
+    (is (equal (conskivi-lindex db :key1 1) "x"))))
+
+(def-test list-lscan (:suite list-operations)
+  (with-fixture test-database ()
+    (iter (for i from 1 to 10)
+      (conskivi-rpush db :key1 (format nil "value~a" i)))
+    (let ((result (conskivi-lscan db :key1 nil nil 3)))
+      (is (= (length (first result)) 3))
+      (is (second result)))))
