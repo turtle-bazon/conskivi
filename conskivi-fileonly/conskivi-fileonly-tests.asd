@@ -3,7 +3,7 @@
 (defsystem :conskivi-fileonly-tests
   :name "conskivi-fileonly-tests"
   :author "Azamat S. Kalimoulline <turtle@bazon.ru>"
-  :licence "Lessor Lisp General Public License"
+  :licence "GNU General Public License v3"
   :version "0.0.1.0"
   :description "conskivi fileonly backend tests"
   :depends-on (conskivi-core

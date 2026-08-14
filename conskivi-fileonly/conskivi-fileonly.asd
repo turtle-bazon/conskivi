@@ -3,7 +3,7 @@
 (defsystem :conskivi-fileonly
   :name "conskivi-fileonly"
   :author "Azamat S. Kalimoulline <turtle@bazon.ru>"
-  :licence "Lessor Lisp General Public License"
+  :licence "GNU General Public License v3"
   :version "0.0.1.0"
   :description "conskivi key-value database - file-only backend"
   :depends-on (conskivi-core

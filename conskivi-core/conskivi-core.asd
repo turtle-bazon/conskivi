@@ -3,7 +3,7 @@
 (defsystem :conskivi-core
   :name "conskivi-core"
   :author "Azamat S. Kalimoulline <turtle@bazon.ru>"
-  :licence "Lessor Lisp General Public License"
+  :licence "GNU General Public License v3"
   :version "0.0.1.0"
   :description "Cons Key Value Core"
   :depends-on ()
