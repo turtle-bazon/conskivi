@@ -20,32 +20,7 @@ conskivi-inmemory/    — Pure in-memory backend (reference implementation)
 
 ## Installation
 
-Available via Quicklisp through the [bazon-public](https://github.com/turtle-bazon/quicklisp-bazon-public) repository:
-
-```lisp
-;; Add bazon-public to Quicklisp
-(ql-dist:install-dist "http://packages.bazon.ru/ql/bazon-public.txt")
-```
-
-Then add to `~/.config/common-lisp/source-registry.conf`:
-
-```
-(:source-registry
- (:tree "/path/to/quicklisp-bazon-public/")
- :inherit-configuration)
-```
-
-Or clone and load directly:
-
-```bash
-git clone git@github.com:turtle-bazon/conskivi.git
-```
-
-```lisp
-(push #p"/path/to/conskivi/conskivi-core/" asdf:*central-registry*)
-(push #p"/path/to/conskivi/conskivi-fileonly/" asdf:*central-registry*)
-(asdf:load-system :conskivi-fileonly)
-```
+Available via Quicklisp. See [quicklisp-bazon-public](https://github.com/turtle-bazon/quicklisp-bazon-public) for setup instructions.
 
 ## Usage
 
