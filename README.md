@@ -24,7 +24,7 @@ Available via Quicklisp through the [bazon-public](https://github.com/turtle-baz
 
 ```lisp
 ;; Add bazon-public to Quicklisp
-(ql:add-to-init-file)
+(ql-dist:install-dist "http://packages.bazon.ru/ql/bazon-public.txt")
 ```
 
 Then add to `~/.config/common-lisp/source-registry.conf`:
