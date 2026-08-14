@@ -64,30 +64,30 @@ Available via Quicklisp. See [quicklisp-bazon-public](https://github.com/turtle-
 
 ## Benchmarks
 
-5K entries, AMD Ryzen 7 3700X, Redis v7 pipelined:
+5K entries, AMD Ryzen 7 3700X, Redis v7:
 
 | Operation | conskivi-fileonly | Redis (pipelined) | Redis (single-command) | % vs pipelined | % vs single-command |
 |-----------|------------------:|-------------------:|-----------------------:|---------------:|--------------------:|
-| SET | 10,163 | 776,636 | ~30,000 | 1.3% | 33.9% |
-| GET | 24,038 | 874,359 | ~50,000 | 2.7% | 48.1% |
-| SADD | 1,715 | 852,708 | ~30,000 | 0.2% | 5.7% |
-| HSET | 5,123 | 1,280,078 | ~30,000 | 0.4% | 17.1% |
-| HGET | 21,930 | 923,896 | ~50,000 | 2.4% | 43.9% |
-| ZADD | 5,531 | 1,137,284 | ~30,000 | 0.5% | 18.4% |
-| ZSCORE | 83,333 | 713,608 | ~50,000 | 11.7% | 166.7% |
+| SET | 8,803 | 885,995 | 34,452 | 1.0% | 25.5% |
+| GET | 19,531 | 1,486,920 | 33,133 | 1.3% | 58.9% |
+| SADD | 1,580 | 937,567 | 39,967 | 0.2% | 4.0% |
+| HSET | 4,613 | 628,491 | 32,971 | 0.7% | 14.0% |
+| HGET | 19,531 | 1,495,508 | 33,856 | 1.3% | 57.7% |
+| ZADD | 4,789 | 698,096 | 34,201 | 0.7% | 14.0% |
+| ZSCORE | 65,789 | 1,405,503 | 36,340 | 4.7% | 181.0% |
 
 | Operation | conskivi-inmemory | Redis (pipelined) | Redis (single-command) | % vs pipelined | % vs single-command |
 |-----------|------------------:|-------------------:|-----------------------:|---------------:|--------------------:|
-| SET | 1,315,790 | 776,636 | ~30,000 | 169% | 4,386% |
-| GET | 2,500,000 | 874,359 | ~50,000 | 286% | 5,000% |
-| SADD | 3,124,902 | 852,708 | ~30,000 | 366% | 10,416% |
-| HSET | 2,500,000 | 1,280,078 | ~30,000 | 195% | 8,333% |
-| HGET | 3,125,000 | 923,896 | ~50,000 | 338% | 6,250% |
-| ZADD | 1,562,500 | 1,137,284 | ~30,000 | 137% | 5,208% |
-| ZSCORE | 3,571,301 | 713,608 | ~50,000 | 500% | 7,143% |
+| SET | 1,250,000 | 885,995 | 34,452 | 141% | 3,628% |
+| GET | 2,272,676 | 1,486,920 | 33,133 | 153% | 6,859% |
+| SADD | 3,125,000 | 937,567 | 39,967 | 333% | 7,819% |
+| HSET | 2,500,000 | 628,491 | 32,971 | 398% | 7,582% |
+| HGET | 3,125,000 | 1,495,508 | 33,856 | 209% | 9,230% |
+| ZADD | 1,470,567 | 698,096 | 34,201 | 211% | 4,299% |
+| ZSCORE | 3,125,000 | 1,405,503 | 36,340 | 222% | 8,599% |
 
-Note: "Redis (no pipeline)" estimates are for single-command round-trips on localhost (~10-50K ops/s depending on data size).
-"Redis (pipelined)" batches 5K commands in one TCP write.
+Note: "Redis (pipelined)" batches 5K commands in one TCP write.
+"Redis (single-command)" sends one command per TCP round-trip.
 
 ## License
 
