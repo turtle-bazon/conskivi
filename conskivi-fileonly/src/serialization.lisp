@@ -21,6 +21,7 @@
 (defconstant +type-hash+    7)
 (defconstant +type-zset+    8)
 (defconstant +type-array+   9)
+(defconstant +type-set+    10)
 
 ;;; Binary write helpers
 
