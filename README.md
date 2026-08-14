@@ -26,10 +26,8 @@ Available via Quicklisp. See [quicklisp-bazon-public](https://github.com/turtle-
 
 ```lisp
 ;; Load
-(push "/path/to/conskivi-core/" asdf:*central-registry*)
-(push "/path/to/conskivi-fileonly/" asdf:*central-registry*)
-(asdf:load-system :conskivi-core)
-(asdf:load-system :conskivi-fileonly)
+(ql:quickload :conskivi-core)
+(ql:quickload :conskivi-fileonly)
 
 ;; Start
 (defvar *db* (make-instance 'conskivi-fileonly:conskivi-fileonly-database
