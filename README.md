@@ -86,8 +86,25 @@ Available via Quicklisp. See [quicklisp-bazon-public](https://github.com/turtle-
 | ZADD | 1,749,710 | 698,096 | 34,201 | 251% | 5,116% |
 | ZSCORE | 2,616,690 | 1,405,503 | 36,340 | 186% | 7,199% |
 
-Note: "Redis (pipelined)" batches 5K commands in one TCP write.
+Note: "Redis (pipelined)" batches commands in one TCP write.
 "Redis (single-command)" sends one command per TCP round-trip.
+
+### Concurrent (in-memory only)
+
+20M ops, 100 threads, AMD Ryzen 7 3700X, Redis v7 (100 pipelined clients):
+
+| Operation | conskivi-inmemory | Redis (100 clients) | % of Redis |
+|-----------|------------------:|--------------------:|-----------:|
+| SET | 1,117,062 | 749,732 | 149% |
+| GET | 1,065,410 | 1,128,435 | 94% |
+| SADD | 1,131,214 | 844,208 | 134% |
+| HSET | 931,613 | 663,122 | 141% |
+| HGET | 1,298,693 | 831,504 | 156% |
+| ZADD | 803,983 | 638,302 | 126% |
+| ZSCORE | 1,261,981 | 851,507 | 148% |
+
+Note: Redis uses 100 concurrent pipelined clients over TCP.
+conskivi-inmemory uses 100 native SBCL threads with striped locks.
 
 ## License
 
