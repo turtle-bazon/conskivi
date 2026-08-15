@@ -91,7 +91,7 @@ Note: "Redis (pipelined)" batches commands in one TCP write.
 
 ### Concurrent (in-memory only)
 
-20M ops, 100 threads, AMD Ryzen 7 3700X, Redis v7 (100 pipelined clients):
+100 threads, 20M pre-populated keys, 20M ops per operation type, AMD Ryzen 7 3700X, Redis v7 (100 pipelined clients):
 
 | Operation | conskivi-inmemory | Redis (100 clients) | % of Redis |
 |-----------|------------------:|--------------------:|-----------:|
