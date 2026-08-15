@@ -206,7 +206,71 @@
         (delete-key-data database key)
         t))))
 
-;;; Active expiration thread
+;;; Active expiration thread (Redis-style hybrid)
+;;;
+;;; Lazy expiration: check-expiration is called on every key access.
+;;; Active expiration: randomly sample keys, delete expired ones.
+;;; If sampled keys have high expiry rate, sample more (Redis strategy).
+
+(defparameter *active-expire-sample-size* 10
+  "Number of random keys to sample per active expiration tick.")
+
+(defparameter *active-expire-max-iterations* 4
+  "Maximum sampling iterations if expiry rate is high.")
+
+(defparameter *active-expire-expired-threshold* 0.25
+  "If >= 25% of sampled keys are expired, sample again.")
+
+(defun sample-random-keys (ht count)
+  "Return up to COUNT random keys from hash-table HT."
+  (let ((size (hash-table-count ht)))
+    (when (zerop size)
+      (return-from sample-random-keys nil))
+    (let ((result '())
+          (sampled (make-hash-table :test #'eql)))
+      (loop while (< (hash-table-count sampled) (min count size))
+            do (let ((idx (random size)))
+                 ;; Use maphash with counter to find the idx-th key
+                 (let ((counter 0))
+                   (maphash (lambda (k v)
+                              (declare (ignore v))
+                              (when (= counter idx)
+                                (unless (gethash k sampled)
+                                  (setf (gethash k sampled) t)
+                                  (push k result)))
+                              (incf counter))
+                            ht))))
+      result)))
+
+(defun active-expire-database (database)
+  "Redis-style active expiration: sample random keys, delete expired ones.
+   If high expiry rate detected, sample more aggressively."
+  (let ((now (get-universal-time))
+        (expired-count 0)
+        (sampled-count 0))
+    (flet ((expire-key (key key-data)
+             (when (and (key-data-expiration key-data)
+                        (> now (key-data-expiration key-data)))
+               (delete-key-data database key)
+               (incf expired-count))
+             (incf sampled-count)))
+      (loop for iteration from 1 to *active-expire-max-iterations*
+            do (let ((keys (append
+                            (sample-random-keys
+                             (slot-value database 'base-data)
+                             *active-expire-sample-size*)
+                            (sample-random-keys
+                             (slot-value database 'new-data)
+                             *active-expire-sample-size*))))
+                 (dolist (key keys)
+                   (let ((key-data (get-key-data database key)))
+                     (when key-data
+                       (expire-key key key-data))))
+                 ;; If expiry rate is low, stop early
+                 (when (or (zerop sampled-count)
+                           (< (/ expired-count sampled-count)
+                              *active-expire-expired-threshold*))
+                   (return)))))))
 
 (defmethod start-expiration-thread ((database conskivi-inmemory-database))
   (let ((interval (slot-value database 'ttl-interval)))
@@ -215,16 +279,7 @@
            (lambda ()
              (loop
                (sleep (/ interval 1000.0))
-               (maphash (lambda (key key-data)
-                          (when (and (key-data-expiration key-data)
-                                     (> (get-universal-time) (key-data-expiration key-data)))
-                            (delete-key-data database key)))
-                        (slot-value database 'base-data))
-               (maphash (lambda (key key-data)
-                          (when (and (key-data-expiration key-data)
-                                     (> (get-universal-time) (key-data-expiration key-data)))
-                            (delete-key-data database key)))
-                        (slot-value database 'new-data))))
+               (active-expire-database database)))
            :name "conskivi-expiration"))))
 
 (defmethod stop-expiration-thread ((database conskivi-inmemory-database))
