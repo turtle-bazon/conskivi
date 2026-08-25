@@ -24,14 +24,14 @@
                  (:file "skiplist"
                   :depends-on ("package"))
                  (:file "btree-tree"
-                  :depends-on ("package" "btree-page" "serialization"))
+                  :depends-on ("package" "btree-page" "serialization" "btree-wal"))
                   (:file "btree-wal"
-                   :depends-on ("package" "btree-page"))
+                   :depends-on ("package" "btree-page" "serialization"))
                   (:file "btree-index"
                    :depends-on ("package" "btree-page" "btree-tree" "skiplist" "serialization"))
-                   (:file "conskivi-fileonly"
-                   :depends-on ("package" "serialization" "file-ops"
-                                "btree-page" "btree-tree" "btree-index" "skiplist")))))
+                    (:file "conskivi-fileonly"
+                    :depends-on ("package" "serialization" "file-ops"
+                                 "btree-page" "btree-tree" "btree-wal" "btree-index" "skiplist")))))
   :in-order-to ((test-op (test-op conskivi-fileonly-tests)))
   :perform (test-op :after (op c)
              (funcall

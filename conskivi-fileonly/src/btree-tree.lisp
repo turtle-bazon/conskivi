@@ -51,6 +51,26 @@
   (setf (gethash (page-number page) (btree-page-cache tree)) page)
   page)
 
+(defun btree-log-page (tree page)
+  "Log a modified page to WAL for crash safety."
+  (when (btree-wal tree)
+    (write-page-header page)
+    (let ((data (page-data page)))
+      (wal-write-entry (btree-wal tree)
+                       (make-wal-entry :type +wal-entry-page-write+
+                                       :page-num (page-number page)
+                                       :data (copy-seq data))))))
+
+(defun btree-log-meta (tree)
+  "Log the meta page to WAL for crash safety."
+  (when (btree-wal tree)
+    (let ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
+      (write-meta (btree-meta tree) meta-data)
+      (wal-write-entry (btree-wal tree)
+                       (make-wal-entry :type +wal-entry-meta-update+
+                                       :page-num 0
+                                       :data meta-data)))))
+
 (defun btree-uncache-page (tree page-num)
   "Remove a page from the cache."
   (remhash page-num (btree-page-cache tree)))
@@ -69,6 +89,9 @@
     (let ((page (the btree-page (make-empty-page page-num type))))
       (btree-cache-page tree page)
       (setf (btree-dirty tree) t)
+      ;; Log new empty page and meta to WAL
+      (btree-log-page tree page)
+      (btree-log-meta tree)
       page)))
 
 (defun btree-copy-page (tree page)
@@ -319,6 +342,8 @@
          (let ((slot (btree-find-slot-in-leaf tree page key-bytes)))
            (page-insert-entry-at page slot entry-bytes entry-len)
            (setf (btree-dirty tree) t)
+           ;; Log modified page to WAL
+           (btree-log-page tree page)
            (values nil nil))) ; no split
         ;; Page is full - need to split
          (t
@@ -362,6 +387,9 @@
           ;; Link leaf chain
           (setf (page-next new-page) (page-next page))
           (setf (page-next page) (page-number new-page))
+          ;; Log both modified pages to WAL
+          (btree-log-page tree page)
+          (btree-log-page tree new-page)
           ;; Return the first key of new page as separator
           (values (leaf-entry-key-for-sort tree new-page (leaf-entry-at tree new-page 0))
                   new-page))))))
@@ -398,6 +426,8 @@
     ((= root-page-num 0)
      (let ((page (btree-allocate-page tree +page-type-leaf+)))
        (page-insert-entry-at page 0 entry-bytes (length entry-bytes))
+       ;; Log leaf page to WAL
+       (btree-log-page tree page)
        (page-number page)))
     ;; Non-empty tree
     (t
@@ -415,6 +445,8 @@
                             (new-page-bytes (encode-branch-entry (page-number new-page) sep-key)))
                         (page-insert-entry-at new-root 0 old-root-bytes (length old-root-bytes))
                         (page-insert-entry-at new-root 1 new-page-bytes (length new-page-bytes)))
+                      ;; Log new branch root to WAL
+                      (btree-log-page tree new-root)
                       (page-number new-root)))
                  ;; Branch root is full - need to split branch
                  (error "Branch root split not yet implemented"))
@@ -438,6 +470,8 @@
                                  (progn
                                    (page-insert-entry-at root (1+ slot) new-entry (length new-entry))
                                    (setf (btree-dirty tree) t)
+                                   ;; Log modified branch page to WAL
+                                   (btree-log-page tree root)
                                    (page-number root))
                                  ;; Branch is full - need to split branch
                                  (error "Branch split not yet implemented")))
@@ -491,6 +525,8 @@
                        (page-can-fit-free-space page))
                  ;; Mark tree dirty
                  (setf (btree-dirty tree) t)
+                 ;; Log modified page to WAL
+                 (btree-log-page tree page)
                  (return)))
     found))
 

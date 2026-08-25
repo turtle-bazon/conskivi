@@ -230,25 +230,5 @@
                        (aref data i)))))))))))
 
 ;;; Helper functions for reading/writing u32
-
-(defun read-u32 (stream)
-  "Read a 32-bit unsigned integer from stream (little-endian)."
-  (let ((b0 (read-byte stream))
-        (b1 (read-byte stream))
-        (b2 (read-byte stream))
-        (b3 (read-byte stream)))
-    (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
-
-(defun write-u32 (stream value)
-  "Write a 32-bit unsigned integer to stream (little-endian)."
-  (write-byte (logand value #xFF) stream)
-  (write-byte (logand (ash value -8) #xFF) stream)
-  (write-byte (logand (ash value -16) #xFF) stream)
-  (write-byte (logand (ash value -24) #xFF) stream))
-
-(defun u32-to-bytes (array offset value)
-  "Write a 32-bit unsigned integer to array at offset (little-endian)."
-  (setf (aref array offset) (logand value #xFF))
-  (setf (aref array (+ offset 1)) (logand (ash value -8) #xFF))
-  (setf (aref array (+ offset 2)) (logand (ash value -16) #xFF))
-  (setf (aref array (+ offset 3)) (logand (ash value -24) #xFF)))
+;;; (read-u32, write-u32 are in serialization.lisp)
+;;; (u32-to-bytes is in btree-page.lisp)

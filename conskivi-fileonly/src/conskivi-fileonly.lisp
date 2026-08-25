@@ -150,27 +150,18 @@
                       (let ((type-byte (aref header 0)))
                         (when (member type-byte (list +type-set+ +type-hash+ +type-zset+))
                           (file-position stream 0)
-                          (let* ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8)))
-                                 (n (read-sequence meta-data stream)))
-                            (when (= n +page-size+)
-                              (let ((meta (read-meta meta-data)))
-                                (when (= (meta-magic meta) +meta-magic+)
-                                  (let ((entry (make-collection-index-entry
-                                                :key key
-                                                :type (cond ((= type-byte +type-set+) :set)
-                                                            ((= type-byte +type-hash+) :hash)
-                                                            ((= type-byte +type-zset+) :sorted-set))
-                                                :expiration (meta-expiration meta))))
-                                    (let ((tree (make-btree :meta meta :file-path path)))
-                                      ;; Load all pages
-                                      (loop for page-num from 1 below (meta-page-count meta)
-                                            do (file-position stream (* page-num +page-size+))
-                                               (let ((page-data (make-array +page-size+ :element-type '(unsigned-byte 8))))
-                                                 (read-sequence page-data stream)
-                                                 (let ((page (make-btree-page :number page-num)))
-                                                   (replace (page-data page) page-data)
-                                                   (read-page-header page)
-                                                   (btree-cache-page tree page))))
+                               (let* ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8)))
+                                  (n (read-sequence meta-data stream)))
+                             (when (= n +page-size+)
+                               (let ((meta (read-meta meta-data)))
+                                 (when (= (meta-magic meta) +meta-magic+)
+                                   (let ((entry (make-collection-index-entry
+                                                 :key key
+                                                 :type (cond ((= type-byte +type-set+) :set)
+                                                             ((= type-byte +type-hash+) :hash)
+                                                             ((= type-byte +type-zset+) :sorted-set))
+                                                 :expiration (meta-expiration meta))))
+                                     (let ((tree (btree-open-from-meta path meta-data)))
                                        (setf (cie-tree entry) tree)
                                        ;; Build skiplist from B+tree for sorted sets
                                        (when (eq (cie-type entry) :sorted-set)
@@ -203,6 +194,13 @@
       (setf (slot-value database 'expiration-thread) nil)))
   ;; Flush all B+trees to disk
   (flush-all-collections database))
+
+(defun simulate-crash (database)
+  "Simulate a crash: stop without flushing. WAL entries survive for recovery."
+  (setf (slot-value database 'state) :stopped)
+  (let ((thread (slot-value database 'expiration-thread)))
+    (when thread
+      (setf (slot-value database 'expiration-thread) nil))))
 
 ;;; Basic operations
 

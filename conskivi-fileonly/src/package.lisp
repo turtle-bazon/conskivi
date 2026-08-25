@@ -10,6 +10,8 @@
    #:conskivi-load
    #:conskivi-save
    #:conskivi-start
-   #:conskivi-stop))
+   #:conskivi-stop
+   ;; Crash testing
+   #:simulate-crash))
 
 (in-package #:conskivi-fileonly)
