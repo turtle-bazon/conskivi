@@ -19,6 +19,8 @@
   (mmap-data nil)                         ; mmap'd memory (simple-array)
   (mmap-size 0)                           ; current mmap'd size in bytes
   (mmap-fd nil)                           ; file descriptor for mmap
+  ;; WAL support
+  (wal nil)                               ; WAL struct for crash safety
   ;; Callbacks for encoding/decoding entry keys
   (encode-key-fn #'value-to-key-bytes)    ; function: value -> bytes
   (decode-key-fn (lambda (b) b)))         ; function: bytes -> value
@@ -93,6 +95,10 @@
    :free-list 0
    :free-count 0))
 
+(defun btree-wal-path (ck-file-path)
+  "Return the WAL file path for a .ck file."
+  (make-pathname :type "wal" :defaults ck-file-path))
+
 (defun btree-create (file-path type &optional expiration)
   "Create a new B+tree file with given collection type."
   (ensure-directories-exist file-path)
@@ -100,6 +106,9 @@
          (tree (make-btree :meta meta :file-path file-path)))
     ;; Initialize mmap with initial size (1 page = meta page)
     (btree-init-mmap tree +page-size+)
+    ;; Initialize WAL
+    (let ((wal-path (btree-wal-path file-path)))
+      (setf (btree-wal tree) (wal-create wal-path)))
     tree))
 
 (defun btree-open-from-meta (file-path meta-data)
@@ -108,6 +117,14 @@
          (tree (make-btree :meta meta :file-path file-path)))
     ;; Initialize mmap from existing file
     (btree-init-mmap tree (* (meta-page-count meta) +page-size+))
+    ;; Initialize WAL and recover if needed
+    (let ((wal-path (btree-wal-path file-path)))
+      (let ((wal (wal-open wal-path)))
+        (setf (btree-wal tree) wal)
+        ;; Replay WAL if it has entries
+        (unless (wal-empty-p wal)
+          (wal-replay wal (btree-mmap-data tree))
+          (wal-truncate wal))))
     tree))
 
 ;;; mmap support
@@ -546,9 +563,29 @@
     page))
 
 (defun btree-flush-to-file (tree)
-  "Write dirty pages from cache back to mmap."
+  "Write dirty pages from cache to WAL, then apply to mmap."
   (when (and (btree-dirty tree) (btree-mmap-data tree))
-    (let ((mmap-sap (btree-mmap-data tree)))
+    (let ((wal (btree-wal tree))
+          (mmap-sap (btree-mmap-data tree)))
+      ;; Step 1: Write all changes to WAL
+      ;; Write meta page
+      (let ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
+        (write-meta (btree-meta tree) meta-data)
+        (wal-write-entry wal (make-wal-entry :type +wal-entry-meta-update+
+                                             :page-num 0
+                                             :data meta-data)))
+      ;; Write all cached pages
+      (maphash (lambda (page-num page)
+                 (declare (ignore page-num))
+                 (write-page-header page)
+                 (let ((data (page-data page)))
+                   (wal-write-entry wal (make-wal-entry :type +wal-entry-page-write+
+                                                        :page-num (page-number page)
+                                                        :data data))))
+               (btree-page-cache tree))
+      ;; Step 2: fsync WAL to disk (ensures crash safety)
+      (wal-fsync wal)
+      ;; Step 3: Apply changes to mmap
       ;; Write meta page
       (let ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
         (write-meta (btree-meta tree) meta-data)
@@ -558,16 +595,16 @@
       (maphash (lambda (page-num page)
                  (declare (ignore page-num))
                  (let ((offset (* (page-number page) +page-size+)))
-                   ;; Write header to mmap
                    (write-page-header page)
-                   ;; Copy page data to mmap
                    (let ((data (page-data page)))
                      (dotimes (i +page-usable-size+)
                        (setf (cffi:mem-ref mmap-sap :unsigned-char (+ offset i)) (aref data i))))))
                (btree-page-cache tree))
-      (setf (btree-dirty tree) nil)
-      ;; Sync to disk
-      (sb-posix:msync mmap-sap (btree-mmap-size tree) sb-posix:ms-sync))))
+      ;; Step 4: msync mmap to disk
+      (sb-posix:msync mmap-sap (btree-mmap-size tree) sb-posix:ms-sync)
+      ;; Step 5: Truncate WAL (changes are now durable)
+      (wal-truncate wal)
+      (setf (btree-dirty tree) nil))))
 
 ;;; Iterate all entries
 
@@ -588,4 +625,26 @@
                    do (funcall function entry-key entry))
               (setf page (when (> (page-next page) 0)
                            (btree-read-page tree (page-next page)))))))
+
+;;; Cleanup
+
+(defun btree-close (tree)
+  "Close the B+tree and release resources."
+  ;; Flush any pending changes
+  (when (btree-dirty tree)
+    (btree-flush-to-file tree))
+  ;; Close WAL
+  (when (btree-wal tree)
+    (wal-close (btree-wal tree))
+    (setf (btree-wal tree) nil))
+  ;; Unmap
+  (when (btree-mmap-data tree)
+    (sb-posix:munmap (btree-mmap-data tree) (btree-mmap-size tree))
+    (setf (btree-mmap-data tree) nil))
+  ;; Close file descriptor
+  (when (btree-mmap-fd tree)
+    (sb-posix:close (btree-mmap-fd tree))
+    (setf (btree-mmap-fd tree) nil))
+  ;; Clear cache
+  (clrhash (btree-page-cache tree)))
 

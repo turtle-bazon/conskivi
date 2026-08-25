@@ -25,6 +25,8 @@
                   :depends-on ("package"))
                  (:file "btree-tree"
                   :depends-on ("package" "btree-page" "serialization"))
+                  (:file "btree-wal"
+                   :depends-on ("package" "btree-page"))
                   (:file "btree-index"
                    :depends-on ("package" "btree-page" "btree-tree" "skiplist" "serialization"))
                    (:file "conskivi-fileonly"
