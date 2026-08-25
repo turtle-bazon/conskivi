@@ -15,6 +15,10 @@
     (make-hash-table :test #'eql))
   (file-path nil)                         ; pathname to .ck file
   (dirty nil)                             ; has uncommitted changes
+  ;; mmap support
+  (mmap-data nil)                         ; mmap'd memory (simple-array)
+  (mmap-size 0)                           ; current mmap'd size in bytes
+  (mmap-fd nil)                           ; file descriptor for mmap
   ;; Callbacks for encoding/decoding entry keys
   (encode-key-fn #'value-to-key-bytes)    ; function: value -> bytes
   (decode-key-fn (lambda (b) b)))         ; function: bytes -> value
@@ -22,9 +26,23 @@
 ;;; Page cache operations
 
 (defun btree-read-page (tree page-num)
-  "Read a page from cache or disk."
+  "Read a page from cache or mmap."
   (or (gethash page-num (btree-page-cache tree))
-      (error "Page ~d not in cache" page-num)))
+      ;; Read from mmap if available
+      (when (btree-mmap-data tree)
+        (let* ((offset (* page-num +page-size+))
+               (mmap-sap (btree-mmap-data tree))
+               (page (make-btree-page :number page-num))
+               (data (page-data page)))
+          ;; Copy data from mmap into page struct using CFFI
+          (dotimes (i +page-usable-size+)
+            (setf (aref data i)
+                  (cffi:mem-ref mmap-sap :unsigned-char (+ offset i))))
+          ;; Parse header from the data we just copied
+          (read-page-header page)
+          (setf (gethash page-num (btree-page-cache tree)) page)
+          page))
+      (error "Page ~d not in cache and no mmap" page-num)))
 
 (defun btree-cache-page (tree page)
   "Add a page to the cache."
@@ -42,6 +60,10 @@
   (let* ((meta (btree-meta tree))
          (page-num (meta-page-count meta)))
     (incf (meta-page-count meta))
+    ;; Grow mmap if needed
+    (let ((needed-size (* (meta-page-count meta) +page-size+)))
+      (when (> needed-size (btree-mmap-size tree))
+        (btree-grow-mmap tree needed-size)))
     (let ((page (the btree-page (make-empty-page page-num type))))
       (btree-cache-page tree page)
       (setf (btree-dirty tree) t)
@@ -76,13 +98,79 @@
   (ensure-directories-exist file-path)
   (let* ((meta (btree-init-meta type expiration))
          (tree (make-btree :meta meta :file-path file-path)))
+    ;; Initialize mmap with initial size (1 page = meta page)
+    (btree-init-mmap tree +page-size+)
     tree))
 
 (defun btree-open-from-meta (file-path meta-data)
   "Open an existing B+tree from file."
   (let* ((meta (read-meta meta-data))
          (tree (make-btree :meta meta :file-path file-path)))
+    ;; Initialize mmap from existing file
+    (btree-init-mmap tree (* (meta-page-count meta) +page-size+))
     tree))
+
+;;; mmap support
+
+(defun btree-mmap-create (file-path size)
+  "Create a new mmap for a file of given size."
+  (declare (type (unsigned-byte 32) size))
+  (let ((fd (sb-posix:open (namestring file-path)
+                            (logior sb-posix:o-rdwr sb-posix:o-creat)
+                            #o644)))
+    (when (< fd 0)
+      (error "Failed to open file for mmap: ~a" file-path))
+    ;; Ensure file is at least SIZE bytes
+    (let ((current-size (sb-posix:lseek fd 0 sb-posix:seek-end)))
+      (when (< current-size size)
+        (sb-posix:lseek fd (1- size) sb-posix:seek-set)
+        (cffi:with-foreign-object (buf :unsigned-char)
+          (setf (cffi:mem-ref buf :unsigned-char) 0)
+          (cffi:foreign-funcall "write" :int fd :pointer buf :int 1 :int))))
+    ;; Create mmap
+    (let ((mmap-sap (sb-posix:mmap (cffi:null-pointer) size
+                                   (logior sb-posix:prot-read sb-posix:prot-write)
+                                   sb-posix:map-shared
+                                   fd 0)))
+      (values mmap-sap fd size))))
+
+(defun btree-mmap-extend (fd old-size new-size)
+  "Extend file and return new mmap."
+  (declare (type (unsigned-byte 32) old-size new-size))
+  (sb-posix:munmap (cffi:null-pointer) old-size)
+  (sb-posix:lseek fd (1- new-size) sb-posix:seek-set)
+  (cffi:with-foreign-object (buf :unsigned-char)
+    (setf (cffi:mem-ref buf :unsigned-char) 0)
+    (cffi:foreign-funcall "write" :int fd :pointer buf :int 1 :int))
+  (let ((mmap-sap (sb-posix:mmap (cffi:null-pointer) new-size
+                                 (logior sb-posix:prot-read sb-posix:prot-write)
+                                 sb-posix:map-shared
+                                 fd 0)))
+    (values mmap-sap new-size)))
+
+(defun btree-init-mmap (tree size)
+  "Initialize mmap for the B+tree file."
+  (multiple-value-bind (mmap-sap fd mmap-size)
+      (btree-mmap-create (btree-file-path tree) size)
+    (setf (btree-mmap-data tree) mmap-sap)
+    (setf (btree-mmap-fd tree) fd)
+    (setf (btree-mmap-size tree) mmap-size)
+    ;; If this is a new file, write the meta page
+    (when (and (zerop (meta-page-count (btree-meta tree)))
+               (probe-file (btree-file-path tree)))
+      (let ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
+        (write-meta (btree-meta tree) meta-data)
+        (dotimes (i +page-size+)
+          (setf (cffi:mem-ref mmap-sap :unsigned-char i) (aref meta-data i)))))))
+
+(defun btree-grow-mmap (tree new-size)
+  "Extend the mmap to accommodate more pages."
+  (let ((old-size (btree-mmap-size tree)))
+    (when (> new-size old-size)
+      (multiple-value-bind (mmap-sap mmap-size)
+          (btree-mmap-extend (btree-mmap-fd tree) old-size new-size)
+        (setf (btree-mmap-data tree) mmap-sap)
+        (setf (btree-mmap-size tree) mmap-size)))))
 
 ;;; Key comparison within a B+tree
 
@@ -458,32 +546,28 @@
     page))
 
 (defun btree-flush-to-file (tree)
-  "Write all dirty pages to file."
-  (when (btree-file-path tree)
-    (with-open-file (stream (btree-file-path tree)
-                            :element-type '(unsigned-byte 8)
-                            :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create)
-      ;; Write meta page first (page 0)
+  "Write dirty pages from cache back to mmap."
+  (when (and (btree-dirty tree) (btree-mmap-data tree))
+    (let ((mmap-sap (btree-mmap-data tree)))
+      ;; Write meta page
       (let ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
         (write-meta (btree-meta tree) meta-data)
-        (write-sequence meta-data stream))
+        (dotimes (i +page-size+)
+          (setf (cffi:mem-ref mmap-sap :unsigned-char i) (aref meta-data i))))
       ;; Write all cached pages
       (maphash (lambda (page-num page)
                  (declare (ignore page-num))
-                 (let ((page-data (make-array +page-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
-                    (write-page-header page)
-                    (replace page-data (page-data page))
-                    (file-position stream (* (page-number page) +page-size+))
-                    (write-sequence page-data stream)))
+                 (let ((offset (* (page-number page) +page-size+)))
+                   ;; Write header to mmap
+                   (write-page-header page)
+                   ;; Copy page data to mmap
+                   (let ((data (page-data page)))
+                     (dotimes (i +page-usable-size+)
+                       (setf (cffi:mem-ref mmap-sap :unsigned-char (+ offset i)) (aref data i))))))
                (btree-page-cache tree))
-      ;; Update meta with correct page count
-      (let ((meta-data (make-array +page-size+ :element-type '(unsigned-byte 8) :initial-element 0)))
-        (write-meta (btree-meta tree) meta-data)
-        (file-position stream 0)
-        (write-sequence meta-data stream))
-      (setf (btree-dirty tree) nil))))
+      (setf (btree-dirty tree) nil)
+      ;; Sync to disk
+      (sb-posix:msync mmap-sap (btree-mmap-size tree) sb-posix:ms-sync))))
 
 ;;; Iterate all entries
 
