@@ -182,7 +182,7 @@
                                          (setf (cie-count entry)
                                                (meta-entry-count (btree-meta tree))))
                                        (setf (gethash key index) entry)))))))))))
-             (error () nil))))))))
+             (error (c) (warn "Failed to load B+tree ~a: ~a" path c)))))))))
   (setf (slot-value database 'state) :running)
   (start-expiration-thread database))
 
