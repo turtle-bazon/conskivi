@@ -309,8 +309,75 @@
 
 ;;; Save logic
 
+(defparameter *persisted-types*
+  '(:string :integer :float :boolean :keyword :list
+    :hash :sorted-set :array :set)
+  "Type tags recognized in save-file records.")
+
+(defun freeze-value (value)
+  "Convert VALUE into a READ-printable structure.
+Hash-tables and sorted-sets (which print unreadably) become tagged
+plain lists; every list/vector level carries its own tag, so thaw
+is exact. Scalars pass through untouched."
+  (cond
+    ((sorted-set-p value)
+     (list :sorted-set
+           (let ((pairs '()))
+             (maphash (lambda (m s)
+                        (push (cons (freeze-value m) (freeze-value s)) pairs))
+                      (sorted-set-scores value))
+             pairs)))
+    ((hash-table-p value)
+     (list :hash
+           (let ((pairs '()))
+             (maphash (lambda (k v)
+                        (push (cons (freeze-value k) (freeze-value v)) pairs))
+                      value)
+             pairs)))
+    ((and (vectorp value) (not (stringp value)))
+     (list :array (array-dimensions value)
+           (mapcar #'freeze-value (coerce value 'list))))
+    ((consp value)
+     (cons :list (mapcar #'freeze-value value)))
+    (t value)))
+
+(defun thaw-value (frozen)
+  "Rebuild a value frozen with FREEZE-VALUE."
+  (cond
+    ((and (consp frozen) (eq (car frozen) :sorted-set))
+     (let ((ss (make-sorted-set :scores (make-hash-table :test #'equal)
+                                :members (make-hash-table :test #'equal))))
+       (dolist (p (cadr frozen))
+         (let ((m (thaw-value (car p)))
+               (s (thaw-value (cdr p))))
+           (setf (gethash m (sorted-set-scores ss)) s)
+           (setf (gethash m (sorted-set-members ss)) t)))
+       ss))
+    ((and (consp frozen) (eq (car frozen) :hash))
+     (let ((ht (make-hash-table :test #'equal)))
+       (dolist (p (cadr frozen))
+         (setf (gethash (thaw-value (car p)) ht)
+               (thaw-value (cdr p))))
+       ht))
+    ((and (consp frozen) (eq (car frozen) :array))
+     (let ((arr (make-array (cadr frozen))))
+       (dotimes (i (length (caddr frozen)))
+         (setf (row-major-aref arr i)
+               (thaw-value (nth i (caddr frozen)))))
+       arr))
+    ((and (consp frozen) (eq (car frozen) :list))
+     (mapcar #'thaw-value (cdr frozen)))
+    (t frozen)))
+
+(defun new-record-p (record)
+  "True for new-format save records: (KEY TYPE FROZEN-VALUE)."
+  (and (consp record)
+       (eql 3 (list-length record))
+       (member (cadr record) *persisted-types*)))
+
 (defmethod write-to-disk ((database conskivi-inmemory-database))
-  "Write base-data to disk with atomic rename."
+  "Write base-data to disk with atomic rename.
+Records are (KEY TYPE FROZEN-VALUE); see FREEZE-VALUE."
   (let* ((db-path (slot-value database 'db-path))
          (save-path (make-pathname :defaults db-path
                                    :name (pathname-name db-path)
@@ -319,7 +386,11 @@
                                       :if-exists :supersede
                                       :if-does-not-exist :create)
       (maphash (lambda (key key-data)
-                 (write (cons key (key-data-value key-data)) :stream stream))
+                 (write (list key
+                              (key-data-type key-data)
+                              (freeze-value (key-data-value key-data)))
+                        :stream stream)
+                 (terpri stream))
                (slot-value database 'base-data)))
     ;; Atomic rename
     (rename-file save-path db-path)))
@@ -937,17 +1008,21 @@
                     (setf (gethash member ht) t)))
                 added))
             (progn
-              (let ((ht (make-hash-table :test #'equal)))
+              (let ((ht (make-hash-table :test #'equal))
+                    (added 0))
                 (dolist (m members)
-                  (setf (gethash m ht) t))
+                  (unless (gethash m ht)
+                    (incf added)
+                    (setf (gethash m ht) t)))
                 (set-key-data database key
                               (make-key-data :value ht :type :set))
-                (length members))))))))
+                added)))))))
 
 (defmethod conskivi-srem ((database conskivi-inmemory-database) key &rest members)
   (let ((lock (get-stripe-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((key-data (ensure-mutable-key-data database key)))
+      (let ((key-data (ensure-mutable-key-data database key))
+            (removed 0))
         (when (and key-data
                    (or (listp (key-data-value key-data))
                        (hash-table-p (key-data-value key-data))))
@@ -957,13 +1032,12 @@
                           (dolist (m (key-data-value key-data))
                             (setf (gethash m new-ht) t))
                           (setf (key-data-value key-data) new-ht)
-                          new-ht)))
-                (removed 0))
+                          new-ht))))
             (dolist (member members)
               (when (gethash member ht)
                 (incf removed)
-                (remhash member ht)))
-            removed))))))
+                (remhash member ht)))))
+        removed))))
 
 (defmethod conskivi-smembers ((database conskivi-inmemory-database) key)
   (let ((lock (get-stripe-lock database key)))
@@ -1098,18 +1172,18 @@
 (defmethod conskivi-zrem ((database conskivi-inmemory-database) key &rest members)
   (let ((lock (get-stripe-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((key-data (ensure-mutable-key-data database key)))
+      (let ((key-data (ensure-mutable-key-data database key))
+            (removed 0))
         (when (and key-data (sorted-set-p (key-data-value key-data)))
           (let* ((ss (key-data-value key-data))
                  (scores (sorted-set-scores ss))
-                 (members-ht (sorted-set-members ss))
-                 (removed 0))
+                 (members-ht (sorted-set-members ss)))
             (dolist (member members)
               (when (gethash member members-ht)
                 (incf removed)
                 (remhash member members-ht)
-                (remhash member scores)))
-            removed))))))
+                (remhash member scores)))))
+        removed))))
 
 (defmethod conskivi-zrange ((database conskivi-inmemory-database) key start stop &optional withscores)
   (let ((lock (get-stripe-lock database key)))
@@ -1119,9 +1193,12 @@
           (let* ((ss (key-data-value key-data))
                  (sorted (sort (copy-list (hash-table-keys (sorted-set-scores ss)))
                               #'<
-                              :key (lambda (m) (gethash m (sorted-set-scores ss))))))
+                              :key (lambda (m) (gethash m (sorted-set-scores ss)))))
+                 (len (length sorted)))
+            (when (< start 0) (setf start (max 0 (+ len start))))
+            (when (< stop 0) (setf stop (+ len stop)))
             (let ((result '()))
-              (iter (for i from (max 0 start) to (min (1- (length sorted)) stop))
+              (iter (for i from (max 0 (min start (1- len))) to (min (1- len) stop))
                 (let ((member (nth i sorted)))
                   (if withscores
                       (progn
@@ -1138,9 +1215,12 @@
           (let* ((ss (key-data-value key-data))
                  (sorted (sort (copy-list (hash-table-keys (sorted-set-scores ss)))
                               #'>
-                              :key (lambda (m) (gethash m (sorted-set-scores ss))))))
+                              :key (lambda (m) (gethash m (sorted-set-scores ss)))))
+                 (len (length sorted)))
+            (when (< start 0) (setf start (max 0 (+ len start))))
+            (when (< stop 0) (setf stop (+ len stop)))
             (let ((result '()))
-              (iter (for i from (max 0 start) to (min (1- (length sorted)) stop))
+              (iter (for i from (max 0 (min start (1- len))) to (min (1- len) stop))
                 (let ((member (nth i sorted)))
                   (if withscores
                       (progn
@@ -1168,7 +1248,16 @@
   (let ((lock (get-stripe-lock database key)))
     (bt2:with-lock-held (lock)
       (let ((key-data (ensure-mutable-key-data database key)))
-        (unless (and key-data (sorted-set-p (key-data-value key-data)))
+        (unless key-data
+          ;; Missing key: create it (Redis parity).
+          (let ((ss (make-sorted-set :scores (make-hash-table :test #'equal)
+                                     :members (make-hash-table :test #'equal))))
+            (setf (gethash member (sorted-set-scores ss)) increment)
+            (setf (gethash member (sorted-set-members ss)) t)
+            (set-key-data database key
+                          (make-key-data :value ss :type :sorted-set))
+            (return-from conskivi-zincrby increment)))
+        (unless (sorted-set-p (key-data-value key-data))
           (error "Key ~a is not a sorted set" key))
         (let* ((ss (key-data-value key-data))
                (scores (sorted-set-scores ss))
@@ -1277,7 +1366,14 @@
   (let ((lock (get-stripe-lock database key)))
     (bt2:with-lock-held (lock)
       (let ((key-data (ensure-mutable-key-data database key)))
-        (unless (and key-data (hash-table-p (key-data-value key-data)))
+        (unless key-data
+          ;; Missing key: create it (Redis parity).
+          (let ((ht (make-hash-table :test #'equal)))
+            (setf (gethash field ht) increment)
+            (set-key-data database key
+                          (make-key-data :value ht :type :hash))
+            (return-from conskivi-hincrby increment)))
+        (unless (hash-table-p (key-data-value key-data))
           (error "Key ~a is not a hash" key))
         (let* ((ht (key-data-value key-data))
                (current (gethash field ht 0)))
@@ -1291,10 +1387,15 @@
     (bt2:with-lock-held (lock)
       (let ((key-data (get-key-data database key)))
         (when (and key-data (hash-table-p (key-data-value key-data)))
-          (let ((result '())
+          (let ((pairs (nthcdr (or cursor 0)
+                               (hash-table-alist (key-data-value key-data))))
+                (result '())
                 (remaining (or count 10))
                 (next-cursor nil))
-            (iter (for (k v) on (hash-table-alist (key-data-value key-data)) by #'cdr)
+            (iter (for i from (or cursor 0))
+              (for pair in pairs)
+              (for k = (car pair))
+              (for v = (cdr pair))
               (when (and (or (null pattern)
                              (cl-ppcre:scan pattern (format nil "~a" k)))
                          (> remaining 0))
@@ -1302,8 +1403,8 @@
                 (push v result)
                 (decf remaining)
                 (when (= remaining 0)
-                  (setf next-cursor k)))
-              (finally (return (list (reverse result) next-cursor))))))))))
+                  (setf next-cursor (1+ i))))
+              (finally (return (list (nreverse result) next-cursor))))))))))
 
 ;;; Lifecycle
 
@@ -1313,12 +1414,17 @@
       (when (probe-file (slot-value database 'db-path))
         (with-open-file (stream (slot-value database 'db-path) :direction :input)
           (iter
-            (for key-value = (read stream nil nil))
-            (while key-value)
-            (for key = (car key-value))
-            (for value = (cdr key-value))
-            (setf (gethash key (slot-value database 'base-data))
-                  (make-key-data :value value :type (detect-type value)))))))))
+            (for record = (read stream nil nil))
+            (while record)
+            (if (new-record-p record)
+                ;; Current format: (key type frozen-value).
+                (setf (gethash (car record) (slot-value database 'base-data))
+                      (make-key-data :value (thaw-value (third record))
+                                     :type (cadr record)))
+                ;; Legacy format: (key . value).
+                (let ((value (cdr record)))
+                  (setf (gethash (car record) (slot-value database 'base-data))
+                        (make-key-data :value value :type (detect-type value)))))))))))
 
 (defmethod conskivi-save ((database conskivi-inmemory-database))
   (save-now database))

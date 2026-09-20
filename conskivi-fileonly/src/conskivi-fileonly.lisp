@@ -52,33 +52,97 @@
 ;;; TTL support
 
 (defun check-expiration (database key)
+  "Evict KEY if its TTL has passed. Returns T when something was evicted.
+Handles both simple key files ([type-tag][expiration]...) and B+tree
+collection files (expiry in the meta page). Collection eviction also
+drops the in-memory index entry so reads stop serving the key."
   (let ((path (key-file-path database key)))
     (when (probe-file path)
-      (with-open-file (stream path :element-type '(unsigned-byte 8) :if-does-not-exist nil)
-        (when stream
-          (let ((type-tag (read-u8 stream))
-                (expiration (read-i64 stream)))
-            (declare (ignore type-tag))
-            (when (and (plusp expiration)
+      (if (collection-file-kind path)
+          (let ((expiration (collection-file-expiration path)))
+            (when (and expiration (plusp expiration)
                        (> (get-universal-time) expiration))
+              (remhash key (get-collection-index database))
               (delete-file path)
-              t)))))))
+              t))
+          (with-open-file (stream path :element-type '(unsigned-byte 8) :if-does-not-exist nil)
+            (when stream
+              (let ((type-tag (read-u8 stream))
+                    (expiration (read-i64 stream)))
+                (declare (ignore type-tag))
+                (when (and (plusp expiration)
+                           (> (get-universal-time) expiration))
+                  (delete-file path)
+                  t))))))))
+
+(defun collection-kind-for-key (database key)
+  "Resolve :set, :hash or :sorted-set for an existing collection KEY.
+Consults the in-memory index first, then the file header. NIL otherwise."
+  (let ((entry (live-collection-entry database key)))
+    (if entry
+        (ecase (cie-type entry)
+          (:set :set)
+          (:hash :hash)
+          (:sorted-set :sorted-set))
+        (collection-file-kind (key-file-path database key)))))
+
+(defun set-collection-expiration (database key seconds)
+  "Set TTL on a collection KEY via its B+tree meta page. Returns T, or
+NIL when KEY is not an existing collection."
+  (let ((kind (collection-kind-for-key database key)))
+    (when kind
+      (let ((entry (ensure-collection-index database key kind))
+            (expiry (+ (get-universal-time) seconds)))
+        (when (and entry (cie-tree entry))
+          (setf (cie-expiration entry) expiry)
+          (setf (meta-expiration (btree-meta (cie-tree entry))) expiry)
+          (btree-flush-to-file (cie-tree entry))
+          t)))))
+
+(defun collection-ttl (database key)
+  "TTL of a collection KEY: seconds left, -1 when persistent, NIL when
+KEY is not a collection."
+  (let ((entry (live-collection-entry database key)))
+    (if entry
+        (let ((exp (cie-expiration entry)))
+          (if (plusp exp)
+              (max 0 (- exp (get-universal-time)))
+              -1))
+        (when (collection-file-kind (key-file-path database key))
+          (let ((exp (collection-file-expiration (key-file-path database key))))
+            (if (and exp (plusp exp))
+                (max 0 (- exp (get-universal-time)))
+                -1))))))
+
+(defun persist-collection (database key)
+  "Clear the TTL of a collection KEY. Returns T, or NIL when KEY is
+not an existing collection."
+  (let ((kind (collection-kind-for-key database key)))
+    (when kind
+      (let ((entry (ensure-collection-index database key kind)))
+        (when (and entry (cie-tree entry))
+          (setf (cie-expiration entry) 0)
+          (setf (meta-expiration (btree-meta (cie-tree entry))) 0)
+          (btree-flush-to-file (cie-tree entry))
+          t)))))
 
 (defun set-expiration-impl (database key seconds)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (multiple-value-bind (value type old-exp)
-          (read-key-file database key)
-        (declare (ignore old-exp))
-        (when type
-          (write-key-file database key value type
-                          (+ (get-universal-time) seconds)))))))
+      (or (set-collection-expiration database key seconds)
+          (multiple-value-bind (value type old-exp)
+              (read-key-file database key)
+            (declare (ignore old-exp))
+            (when type
+              (write-key-file database key value type
+                              (+ (get-universal-time) seconds))))))))
 
 (defun get-ttl-impl (database key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((path (key-file-path database key)))
-        (if (probe-file path)
+      (or (collection-ttl database key)
+          (let ((path (key-file-path database key)))
+            (if (probe-file path)
             (with-open-file (stream path :element-type '(unsigned-byte 8) :if-does-not-exist nil)
               (if stream
                   (let ((type-tag (read-u8 stream))
@@ -88,16 +152,17 @@
                         (max 0 (- expiration (get-universal-time)))
                         -1))
                   -2))
-            -2)))))
+            -2))))))
 
 (defun persist-key-impl (database key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (multiple-value-bind (value type old-exp)
-          (read-key-file database key)
-        (declare (ignore old-exp))
-        (when type
-          (write-key-file database key value type 0))))))
+      (or (persist-collection database key)
+          (multiple-value-bind (value type old-exp)
+              (read-key-file database key)
+            (declare (ignore old-exp))
+            (when type
+              (write-key-file database key value type 0)))))))
 
 ;;; Active expiration thread
 
@@ -224,6 +289,10 @@
     (bt2:with-lock-held (lock)
       (when (check-expiration database key)
         (return-from conskivi-core:conskivi-get nil))
+      ;; Collection keys hold no scalar value; reading one must neither
+      ;; crash on the B+tree header nor disturb the .ck file.
+      (when (live-collection-entry database key)
+        (return-from conskivi-core:conskivi-get nil))
       (multiple-value-bind (value type expiration)
           (read-key-file database key)
         (declare (ignore type expiration))
@@ -245,15 +314,26 @@
 (defmethod conskivi-core:conskivi-exists ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
+      (when (check-expiration database key)
+        (return-from conskivi-core:conskivi-exists nil))
       (if (probe-file (key-file-path database key)) 1 nil))))
 
 (defmethod conskivi-core:conskivi-type ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (multiple-value-bind (value type expiration)
-          (read-key-file database key)
-        (declare (ignore value expiration))
-        type))))
+      (when (check-expiration database key)
+        (return-from conskivi-core:conskivi-type nil))
+      (let ((entry (live-collection-entry database key)))
+        (if entry
+            (ecase (cie-type entry)
+              (:set :set)
+              (:hash :hash)
+              (:sorted-set :sorted-set))
+            (or (collection-file-kind (key-file-path database key))
+                (multiple-value-bind (value type expiration)
+                    (read-key-file database key)
+                  (declare (ignore value expiration))
+                  type)))))))
 
 (defmethod conskivi-core:conskivi-keys ((database conskivi-fileonly-database) &optional pattern)
   (let ((keys (list-all-keys database)))
@@ -270,7 +350,8 @@
     (loop for i from start
           for key in (nthcdr start all-keys)
           repeat cnt
-          when (or (null pattern) (cl-ppcre:scan pattern key))
+          for name = (if (symbolp key) (symbol-name key) key)
+          when (or (null pattern) (cl-ppcre:scan pattern name))
           do (push key result))
     (when (<= (+ start cnt) (length all-keys))
       (setf next-cursor (+ start cnt)))
@@ -568,18 +649,21 @@
 (defmethod conskivi-core:conskivi-srem ((database conskivi-fileonly-database) key &rest members)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (ensure-collection-index database key :set)))
-        (let ((removed 0))
+      ;; NB: live lookup, not ensure: SREM on a missing key returns 0
+      ;; and must not create an empty .ck file.
+      (let ((entry (live-collection-entry database key))
+            (removed 0))
+        (when entry
           (dolist (member members)
             (when (index-srem entry member)
               (incf removed)))
-          (setf (btree-dirty (cie-tree entry)) t)
-          removed)))))
+          (setf (btree-dirty (cie-tree entry)) t))
+        removed))))
 
 (defmethod conskivi-core:conskivi-smembers ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-smembers entry)
             nil)))))
@@ -587,14 +671,14 @@
 (defmethod conskivi-core:conskivi-sismember ((database conskivi-fileonly-database) key member)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if (and entry (index-sismember entry member))
             1 nil)))))
 
 (defmethod conskivi-core:conskivi-scard ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry (index-scard entry) 0)))))
 
 (defmethod conskivi-core:conskivi-sunion ((database conskivi-fileonly-database) keys)
@@ -609,7 +693,7 @@
 (defmethod conskivi-core:conskivi-sscan ((database conskivi-fileonly-database) key cursor &optional pattern count)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-sscan entry cursor pattern count)
             (list nil nil))))))
@@ -632,7 +716,7 @@
 (defmethod conskivi-core:conskivi-zrem ((database conskivi-fileonly-database) key &rest members)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database)))
+      (let ((entry (live-collection-entry database key))
             (removed 0))
         (when entry
           (dolist (member members)
@@ -644,7 +728,7 @@
 (defmethod conskivi-core:conskivi-zrange ((database conskivi-fileonly-database) key start stop &optional withscores)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (if withscores
                 (index-zrange-withscores entry start stop)
@@ -654,7 +738,7 @@
 (defmethod conskivi-core:conskivi-zrevrange ((database conskivi-fileonly-database) key start stop &optional withscores)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-zrevrange entry start stop withscores)
             nil)))))
@@ -662,7 +746,7 @@
 (defmethod conskivi-core:conskivi-zscore ((database conskivi-fileonly-database) key member)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-zscore entry member)
             nil)))))
@@ -670,7 +754,7 @@
 (defmethod conskivi-core:conskivi-zcard ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-zcard entry)
             0)))))
@@ -686,7 +770,7 @@
 (defmethod conskivi-core:conskivi-zscan ((database conskivi-fileonly-database) key cursor &optional pattern count)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-zscan entry cursor pattern count)
             (list nil nil))))))
@@ -704,7 +788,7 @@
 (defmethod conskivi-core:conskivi-hget ((database conskivi-fileonly-database) key field)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-hget entry field)
             nil)))))
@@ -712,7 +796,7 @@
 (defmethod conskivi-core:conskivi-hdel ((database conskivi-fileonly-database) key field)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if (and entry (index-hdel entry field))
             (progn
               (setf (btree-dirty (cie-tree entry)) t)
@@ -722,7 +806,7 @@
 (defmethod conskivi-core:conskivi-hgetall ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-hgetall entry)
             nil)))))
@@ -730,7 +814,7 @@
 (defmethod conskivi-core:conskivi-hkeys ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-hkeys entry)
             nil)))))
@@ -738,7 +822,7 @@
 (defmethod conskivi-core:conskivi-hvals ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-hvals entry)
             nil)))))
@@ -746,7 +830,7 @@
 (defmethod conskivi-core:conskivi-hexists ((database conskivi-fileonly-database) key field)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if (and entry (index-hexists entry field))
             1 nil)))))
 
@@ -761,7 +845,7 @@
 (defmethod conskivi-core:conskivi-hscan ((database conskivi-fileonly-database) key cursor &optional pattern count)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
-      (let ((entry (gethash key (get-collection-index database))))
+      (let ((entry (live-collection-entry database key)))
         (if entry
             (index-hscan entry cursor pattern count)
             (list nil nil))))))

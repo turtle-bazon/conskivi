@@ -345,6 +345,35 @@ Free gap = slot-directory-start - entry-data-end."
     (write-page-header page)
     page))
 
+;;; Collection file identification
+;;;
+;;; B+tree collection files start with the meta magic ("CKTP"), while
+;;; simple key files start with a small type tag (0-10). A zero-filled
+;;; (pre-flush) file matches neither and reports NIL.
+
+(defun collection-file-kind (path)
+  "If PATH is a B+tree collection file, return :set, :hash or :sorted-set.
+Returns NIL for simple key files, zero-filled files and missing files."
+  (with-open-file (stream path :element-type '(unsigned-byte 8)
+                               :if-does-not-exist nil)
+    (when stream
+      (let ((header (make-array 13 :element-type '(unsigned-byte 8))))
+        (when (= (read-sequence header stream) 13)
+          (when (= (bytes-to-u32 header +meta-offset-magic+) +meta-magic+)
+            (let ((type-byte (aref header +meta-offset-type+)))
+              (cond ((= type-byte +type-set+) :set)
+                    ((= type-byte +type-hash+) :hash)
+                    ((= type-byte +type-zset+) :sorted-set)))))))))
+
+(defun collection-file-expiration (path)
+  "Read the meta expiration (universal-time, 0 = none) of a collection file."
+  (with-open-file (stream path :element-type '(unsigned-byte 8)
+                               :if-does-not-exist nil)
+    (when stream
+      (let ((header (make-array 21 :element-type '(unsigned-byte 8))))
+        (when (= (read-sequence header stream) 21)
+          (bytes-to-i64 header +meta-offset-expiration+))))))
+
 ;;; Entry encoding/decoding helpers for leaf entries
 ;;;
 ;;; Set entry: [status:1][member-len:4][member-data:N]

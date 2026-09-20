@@ -409,13 +409,12 @@
            (decode-hash-entry data 0)
          (declare (ignore status value next))
          field))
-      (8 ; zset score-tree
-       ;; Key is the score encoded in bytes for comparison
-       (let ((score (bytes-to-double data 1)))
-         ;; Encode score as key bytes for comparison
-         (let ((result (make-array 8 :element-type '(unsigned-byte 8))))
-           (double-to-bytes result 0 score)
-           result))))))
+      (8 ; zset: the B+tree key is the member (score order lives
+         ; in the skiplist, not the tree)
+       (multiple-value-bind (status score member next)
+           (decode-zset-leaf-entry data 0)
+         (declare (ignore status score next))
+         member)))))
 
 ;;; Insert into B+tree (public API)
 
@@ -499,36 +498,32 @@
 (defun btree-delete-from-leaf (tree page key-bytes)
   "Delete an entry from a leaf page. Returns T if found."
   (let ((count (page-count page))
-        (found nil))
+        (found-idx nil))
     (loop for i from 0 below count
           for entry-offset = (page-entry-start page i)
           for entry-key = (leaf-entry-key tree page entry-offset)
           when (btree-key-equalp tree key-bytes entry-key)
-            do (setf found t)
-               ;; Mark as deleted by shifting entries
-               (let ((entry-len (slot-directory-length page i)))
-                 (declare (ignore entry-len))
-                 ;; Shift entries left
-                 (loop for j from i below (1- count)
-                       do (let ((src-offset (page-entry-start page (1+ j)))
-                                (dst-offset (page-entry-start page j))
-                                (src-len (slot-directory-length page (1+ j))))
-                            ;; Copy entry data
-                            (replace (page-data page) (page-data page)
-                                     :start1 dst-offset :start2 src-offset
-                                     :end2 (+ src-offset src-len))
-                            ;; Update slot directory
-                            (slot-directory-set page j dst-offset src-len)))
-                 ;; Update slot directory count
-                 (decf (page-count page))
-                 (setf (page-free-space page)
-                       (page-can-fit-free-space page))
-                 ;; Mark tree dirty
-                 (setf (btree-dirty tree) t)
-                 ;; Log modified page to WAL
-                 (btree-log-page tree page)
-                  (return)))
-    found))
+            do (setf found-idx i)
+               (return))
+    (when found-idx
+      ;; Snapshot surviving entries first (offsets shift during repack,
+      ;; so in-place memmove with per-slot recomputed offsets corrupts
+      ;; variable-length pages).
+      (let ((survivors nil))
+        (loop for i from 0 below count
+              unless (= i found-idx)
+                do (push (copy-seq (leaf-entry-at tree page i)) survivors))
+        (setf survivors (nreverse survivors))
+        ;; Repack page from scratch in original order.
+        (setf (page-count page) 0)
+        (setf (page-free-space page) +page-usable-size+)
+        (loop for entry in survivors
+              for slot from 0
+              do (page-insert-entry-at page slot entry (length entry)))
+        (setf (page-free-space page) (page-can-fit-free-space page))
+        (setf (btree-dirty tree) t)
+        (btree-log-page tree page)
+        t))))
 
 (defun btree-remove-entry (tree root-page-num key-bytes)
   "Remove the entry with the given key, descending to its leaf. Returns T if found."

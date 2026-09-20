@@ -175,3 +175,218 @@ so hgetall/zrange and warm-load saw a ghost member at the old score."
       (is (equal '("horse" 1 "turtle" 2) (conskivi-hgetall db2 :day)))
       (is (equal 2 (conskivi-hget db2 :day "turtle")))
       (conskivi-stop db2))))
+
+(def-test bug-4-del-invalidates-collection-index (:suite bug-report)
+  "conskivi-del must drop the in-memory collection entry, not just the .ck file.
+Regression: exists/keys (disk-backed) reported the key gone while
+zrange/hgetall/smembers (index-backed) kept serving the deleted members."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-zadd db :z 1.0 "turtle")
+      (conskivi-zadd db :z 2.0 "horse")
+      (conskivi-del db :z)
+      (is (null (conskivi-exists db :z)))
+      (is (null (conskivi-zrange db :z 0 -1 t))
+          "zrange must not serve a deleted key")
+      (is (= 0 (conskivi-zcard db :z)))
+      (is (null (conskivi-keys db)))
+      (conskivi-hset db :h "f" 1)
+      (conskivi-del db :h)
+      (is (null (conskivi-hgetall db :h))
+          "hgetall must not serve a deleted key")
+      (conskivi-sadd db :s "m")
+      (conskivi-del db :s)
+      (is (null (conskivi-smembers db :s))
+          "smembers must not serve a deleted key")
+      (conskivi-stop db))))
+
+(def-test bug-delete-variable-length-leaf-entries (:suite bug-report)
+  "Deleting/updating a non-last leaf entry with unequal entry lengths
+must not corrupt the remaining entries.
+Regression: btree-delete-from-leaf shifted entries in place with
+recomputed offsets, which corrupted variable-length pages (hget
+returned NIL, hgetall lost entries, follow-up deletes signalled
+BOUNDING-INDICES-BAD-ERROR)."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      ;; Unequal lengths: "a"(1) < "bbbbb"(5) < "cc"(2), mixed value sizes.
+      (conskivi-hset db :k "a" 1)
+      (conskivi-hset db :k "bbbbb" "a-much-longer-value-string")
+      (conskivi-hset db :k "cc" 3)
+      ;; Update the FIRST entry to a much longer value (delete+insert path).
+      (conskivi-hset db :k "a" "now-a-is-also-a-long-value-12345")
+      (is (equal "now-a-is-also-a-long-value-12345"
+                 (conskivi-hget db :k "a")))
+      (is (equal "a-much-longer-value-string"
+                 (conskivi-hget db :k "bbbbb"))
+          "neighbour entry must survive an update of the first entry")
+      (is (equal 3 (conskivi-hget db :k "cc"))
+          "last entry must survive an update of the first entry")
+      ;; Delete the FIRST entry; survivors must stay intact.
+      (conskivi-hdel db :k "a")
+      (is (equal '("bbbbb" "a-much-longer-value-string" "cc" 3)
+                 (conskivi-hgetall db :k)))
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      (is (equal '("bbbbb" "a-much-longer-value-string" "cc" 3)
+                 (conskivi-hgetall db2 :k))
+          "survivors must persist across restart")
+      (conskivi-stop db2))))
+
+(def-test bug-delete-middle-leaf-entry (:suite bug-report)
+  "Deleting a middle leaf entry must keep both neighbours intact."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-hset db :k "a" 1)
+      (conskivi-hset db :k "mmmmmmmmmm" 2)
+      (conskivi-hset db :k "z" 3)
+      (conskivi-hdel db :k "mmmmmmmmmm")
+      (is (equal '("a" 1 "z" 3) (conskivi-hgetall db :k)))
+      (is (equal 1 (conskivi-hget db :k "a")))
+      (is (equal 3 (conskivi-hget db :k "z")))
+      (conskivi-stop db))))
+
+(def-test bug-expiry-thread-preserves-collections (:suite bug-report)
+  "The background expiration sweeper must not delete collection files.
+Regression: check-expiration parsed the B+tree meta as a simple key
+header, read a garbage expiration far in the past, and deleted every
+flushed .ck file ~100ms after start. The second restart then lost
+all collection data permanently."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-hset db :h "f" 1)
+      (conskivi-zadd db :z 1.0 "a")
+      (conskivi-sadd db :s "m")
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      ;; Let the expiration thread run several cycles.
+      (sleep 0.6)
+      (is (probe-file (merge-pathnames #p"H.ck" bug-db-path))
+          "hash file must survive the expiry sweeper")
+      (is (probe-file (merge-pathnames #p"Z.ck" bug-db-path))
+          "zset file must survive the expiry sweeper")
+      (is (probe-file (merge-pathnames #p"S.ck" bug-db-path))
+          "set file must survive the expiry sweeper")
+      (is (equal 1 (conskivi-hget db2 :h "f")))
+      (is (equal '("a" 1.0) (conskivi-zrange db2 :z 0 -1 t)))
+      (conskivi-stop db2))
+    (let ((db3 (make-fresh-db bug-db-path)))
+      (is (equal 1 (conskivi-hget db3 :h "f"))
+          "data must survive a second restart")
+      (is (equal '("a" 1.0) (conskivi-zrange db3 :z 0 -1 t)))
+      (is (equal '("m") (conskivi-smembers db3 :s)))
+      (conskivi-stop db3))))
+
+(def-test bug-type-on-collection-keys (:suite bug-report)
+  "conskivi-type must report collection types, not crash.
+Regression: read-key-file ran the simple decoder over the B+tree
+meta page; the magic byte 0x50 fell through the ECASE."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-hset db :h "f" 1)
+      (conskivi-zadd db :z 1.0 "a")
+      (conskivi-sadd db :s "m")
+      (conskivi-put db :str "v")
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      (is (eq :hash (conskivi-type db2 :h)))
+      (is (eq :sorted-set (conskivi-type db2 :z)))
+      (is (eq :set (conskivi-type db2 :s)))
+      (is (eq :string (conskivi-type db2 :str)))
+      (is (null (conskivi-type db2 :missing)))
+      (conskivi-stop db2))))
+
+(def-test bug-get-on-collection-key-preserves-file (:suite bug-report)
+  "conskivi-get on a collection key returns NIL and must leave the
+.ck file alone. Regression: check-expiration misread the meta page
+as expired and DELETED the collection file."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-zadd db :z 1.0 "a")
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      (is (null (conskivi-get db2 :z)))
+      (is (probe-file (merge-pathnames #p"Z.ck" bug-db-path))
+          "get must not delete the collection file")
+      (is (equal '("a" 1.0) (conskivi-zrange db2 :z 0 -1 t)))
+      (conskivi-stop db2))))
+
+(def-test bug-expire-ttl-persist-on-collections (:suite bug-report)
+  "expire/ttl/persist must work on collection keys.
+Regression: expire crashed on flushed files (ECASE over the meta
+magic) and silently did nothing pre-flush; ttl reported garbage."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-hset db :h "f" 1)
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      (conskivi-expire db2 :h 100)
+      (let ((ttl (conskivi-ttl db2 :h)))
+        (is (and (> ttl 0) (<= ttl 100))))
+      (is (equal 1 (conskivi-hget db2 :h "f"))
+          "unexpired key still readable")
+      (conskivi-persist db2 :h)
+      (is (= -1 (conskivi-ttl db2 :h)))
+      (is (equal 1 (conskivi-hget db2 :h "f")))
+      (conskivi-stop db2))))
+
+(def-test bug-collection-expiry-fires (:suite bug-report)
+  "An expired collection reads as missing (data + index evicted)."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-hset db :h "f" 1)
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      (conskivi-expire db2 :h 1)
+      ;; universal-time has 1s resolution: sleep 2 to cross the boundary.
+      (sleep 2)
+      (is (null (conskivi-hgetall db2 :h)))
+      (is (null (conskivi-exists db2 :h)))
+      (is (not (member :h (conskivi-keys db2))))
+      (conskivi-stop db2))))
+
+(def-test bug-zrange-withscores-on-drained-set (:suite bug-report)
+  "Range reads on a fully-drained sorted set return NIL, not a crash.
+Regression: (nth 0 nil) produced a NIL entry whose score failed the
+REAL type check."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-zadd db :e 1.0 "x")
+      (conskivi-zrem db :e "x")
+      (is (= 0 (conskivi-zcard db :e)))
+      (is (null (conskivi-zrange db :e 0 -1)))
+      (is (null (conskivi-zrange db :e 0 -1 t)))
+      (is (null (conskivi-zrevrange db :e 0 -1)))
+      (is (null (conskivi-zrevrange db :e 0 -1 t)))
+      (conskivi-stop db))))
+
+(def-test bug-sinter-missing-key (:suite bug-report)
+  "A missing key is an empty set: sinter with it is NIL.
+Regression: missing non-first keys were skipped, returning the
+present set's members."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-sadd db :a "x" "y")
+      (conskivi-sadd db :b "y" "z")
+      (is (null (conskivi-sinter db (list :a :missing))))
+      (is (null (conskivi-sinter db (list :missing :a))))
+      (let ((inter (conskivi-sinter db (list :a :b))))
+        (is (= 1 (length inter)))
+        (is (member "y" inter :test #'equal)))
+      ;; union/difference skip missing keys (union with empty).
+      (is (= 2 (length (conskivi-sunion db (list :a :missing)))))
+      (is (= 2 (length (conskivi-sdiff db (list :a :missing)))))
+      (conskivi-stop db))))
+
+(def-test bug-srem-missing-key-creates-nothing (:suite bug-report)
+  "SREM on a missing key returns 0 and creates no .ck file.
+Regression: the method used ensure-collection-index, materialising
+an empty collection file (plus mmap/WAL) on a read-like op."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (is (= 0 (conskivi-srem db :ghost "m")))
+      (is (null (directory (merge-pathnames #p"*.ck" bug-db-path)))
+          "no collection file may appear")
+      (is (= 0 (conskivi-zrem db :ghost "m")))
+      (is (null (conskivi-hdel db :ghost "f")))
+      (conskivi-stop db))))

@@ -26,6 +26,19 @@
   "Get the collection index hash-table from the database."
   (slot-value database 'collection-index))
 
+(defun live-collection-entry (database key)
+  "In-memory collection entry for KEY, or NIL if absent.
+Evicts entries whose TTL has passed (drops the file and the index,
+so expired collections read as missing instead of stale)."
+  (let ((entry (gethash key (get-collection-index database))))
+    (when entry
+      (let ((exp (cie-expiration entry)))
+        (when (and (plusp exp) (> (get-universal-time) exp))
+          (remhash key (get-collection-index database))
+          (delete-key-file database key)
+          (return-from live-collection-entry nil)))
+      entry)))
+
 (defun ensure-collection-index (database key type &optional expiration)
   "Get or create a collection index entry for a key."
   (let ((index (get-collection-index database))
@@ -33,6 +46,8 @@
                      (:set +type-set+)
                      (:hash +type-hash+)
                      (:sorted-set +type-zset+))))
+    ;; An expired entry must not be resurrected; start clean instead.
+    (live-collection-entry database key)
     (or (gethash key index)
         (let ((path (key-file-path database key))
               (entry (make-collection-index-entry
@@ -132,12 +147,11 @@
     (let* ((tree (cie-tree entry))
            (root-page-num (meta-score-root (btree-meta tree))))
       (when (> root-page-num 0)
-        (let ((root-page (btree-read-page tree root-page-num)))
-          (when (btree-delete-from-leaf tree root-page member-key-bytes)
-            (decf (cie-count entry))
-            (decf (meta-entry-count (btree-meta tree)))
-            (setf (btree-dirty tree) t)
-            t))))))
+        (when (btree-remove-entry tree root-page-num member-key-bytes)
+          (decf (cie-count entry))
+          (decf (meta-entry-count (btree-meta tree)))
+          (setf (btree-dirty tree) t)
+          t)))))
 
 (defun index-smembers (entry)
   "Return all members as a list by scanning the B+tree."
@@ -207,12 +221,11 @@
     (let* ((tree (cie-tree entry))
            (root-page-num (meta-score-root (btree-meta tree))))
       (when (> root-page-num 0)
-        (let ((root-page (btree-read-page tree root-page-num)))
-          (when (btree-delete-from-leaf tree root-page field-key-bytes)
-            (decf (cie-count entry))
-            (decf (meta-entry-count (btree-meta tree)))
-            (setf (btree-dirty tree) t)
-            t))))))
+        (when (btree-remove-entry tree root-page-num field-key-bytes)
+          (decf (cie-count entry))
+          (decf (meta-entry-count (btree-meta tree)))
+          (setf (btree-dirty tree) t)
+          t)))))
 
 (defun index-hgetall (entry)
   "Return flat list of (field1 value1 field2 value2 ...) by scanning B+tree."
@@ -348,6 +361,8 @@
                     (push (cons (car key) (cdr key)) all)))
     (setf all (nreverse all))
     (let ((len (length all)))
+      (when (zerop len)
+        (return-from index-zrange nil))
       (when (< start 0) (setf start (max 0 (+ len start))))
       (when (< stop 0) (setf stop (+ len stop)))
       (setf start (max 0 (min start (1- len))))
@@ -383,12 +398,11 @@
               ;; Remove from skiplist
               (let ((key (make-zset-key score member-key-bytes)))
                 (skiplist-delete (cie-score-tree entry) key))
-              ;; Delete from B+tree
-              (let ((root-page (btree-read-page tree root)))
-                (btree-delete-from-leaf tree root-page member-key-bytes)
-                (decf (cie-count entry))
-                (decf (meta-entry-count (btree-meta tree)))
-                (setf (btree-dirty tree) t))
+              ;; Delete from B+tree (descend to the owning leaf)
+              (btree-remove-entry tree root member-key-bytes)
+              (decf (cie-count entry))
+              (decf (meta-entry-count (btree-meta tree)))
+              (setf (btree-dirty tree) t)
               t)))))))
 
 (defun index-zcard (entry)
@@ -420,6 +434,8 @@
                     (push (cons (car key) (cdr key)) all)))
     ;; all is already in descending order from push
     (let ((len (length all)))
+      (when (zerop len)
+        (return-from index-zrevrange nil))
       (when (< start 0) (setf start (max 0 (+ len start))))
       (when (< stop 0) (setf stop (+ len stop)))
       (setf start (max 0 (min start (1- len))))
@@ -445,7 +461,7 @@
   "Union of sets. Returns list of all members across all sets."
   (let ((result (make-hash-table :test #'equal)))
     (dolist (k keys)
-      (let ((entry (gethash k (get-collection-index database))))
+      (let ((entry (live-collection-entry database k)))
         (when entry
           (let ((tree (cie-tree entry))
                 (root (meta-score-root (btree-meta (cie-tree entry)))))
@@ -462,11 +478,11 @@
     (hash-table-keys result)))
 
 (defun index-sinter (database keys)
-  "Intersection of sets. Returns members common to all sets."
+  "Intersection of sets. Returns members common to all sets.
+A missing (or expired) key counts as an empty set, so the result is NIL."
   (when keys
-    (let ((first-members nil)
-          (rest-keys (cdr keys)))
-      (let ((entry (gethash (car keys) (get-collection-index database))))
+    (let ((first-members nil))
+      (let ((entry (live-collection-entry database (car keys))))
         (when entry
           (setf first-members (make-hash-table :test #'equal))
           (let ((tree (cie-tree entry))
@@ -478,37 +494,38 @@
                   (multiple-value-bind (status member-bytes)
                       (decode-set-entry entry-bytes 0)
                     (when (= status #x01)
-                      (let ((member (flexi-streams:octets-to-string member-bytes
-                                                                    :external-format :utf-8)))
-                        (setf (gethash member first-members) t))))))))))
+                      (setf (gethash (flexi-streams:octets-to-string
+                                      member-bytes :external-format :utf-8)
+                                     first-members)
+                            t)))))))))
       (when first-members
-        (dolist (k rest-keys)
-          (let ((entry (gethash k (get-collection-index database))))
-            (when entry
-              (let ((new-set (make-hash-table :test #'equal))
-                    (tree (cie-tree entry))
-                    (root (meta-score-root (btree-meta (cie-tree entry)))))
-                (when (> root 0)
-                  (btree-map-entries tree root
-                    (lambda (key-bytes entry-bytes)
-                      (declare (ignore key-bytes))
-                      (multiple-value-bind (status member-bytes)
-                          (decode-set-entry entry-bytes 0)
-                        (when (= status #x01)
-                          (let ((member (flexi-streams:octets-to-string member-bytes
-                                                                        :external-format :utf-8)))
-                            (when (gethash member first-members)
-                               (setf (gethash member new-set) t))))))))
-                (setf first-members new-set)))))
-        (when first-members
-          (hash-table-keys first-members))))))
+        (dolist (k (cdr keys))
+          (let ((entry (live-collection-entry database k)))
+            (unless entry
+              (return-from index-sinter nil))
+            (let ((new-set (make-hash-table :test #'equal))
+                  (tree (cie-tree entry))
+                  (root (meta-score-root (btree-meta (cie-tree entry)))))
+              (when (> root 0)
+                (btree-map-entries tree root
+                  (lambda (key-bytes entry-bytes)
+                    (declare (ignore key-bytes))
+                    (multiple-value-bind (status member-bytes)
+                        (decode-set-entry entry-bytes 0)
+                      (when (= status #x01)
+                        (let ((member (flexi-streams:octets-to-string
+                                       member-bytes :external-format :utf-8)))
+                          (when (gethash member first-members)
+                            (setf (gethash member new-set) t))))))))
+              (setf first-members new-set))))
+        (hash-table-keys first-members)))))
 
 (defun index-sdiff (database keys)
   "Difference of sets. Returns members in first set not in others."
   (when keys
     (let ((first-members nil)
           (rest-keys (cdr keys)))
-      (let ((entry (gethash (car keys) (get-collection-index database))))
+      (let ((entry (live-collection-entry database (car keys))))
         (when entry
           (setf first-members (make-hash-table :test #'equal))
           (let ((tree (cie-tree entry))
@@ -525,7 +542,7 @@
                         (setf (gethash member first-members) t))))))))))
       (when first-members
         (dolist (k rest-keys)
-          (let ((entry (gethash k (get-collection-index database))))
+          (let ((entry (live-collection-entry database k)))
             (when entry
               (let ((tree (cie-tree entry))
                     (root (meta-score-root (btree-meta (cie-tree entry)))))
@@ -574,8 +591,8 @@
           while (and field val (> remaining 0))
           when (or (null pattern)
                    (cl-ppcre:scan pattern (format nil "~a" field)))
-          do (push val result)
-             (push field result)
+          do (push field result)
+             (push val result)
              (decf remaining)
              (when (= remaining 0)
                (setf next-cursor (1+ i))))

@@ -30,5 +30,7 @@
                           :depends-on ("package"))
                          (:file "pubsub-operations"
                           :depends-on ("package"))
-                         (:file "transaction-operations"
-                          :depends-on ("package"))))))
+                          (:file "transaction-operations"
+                           :depends-on ("package"))
+                          (:file "edge-cases"
+                           :depends-on ("package"))))))

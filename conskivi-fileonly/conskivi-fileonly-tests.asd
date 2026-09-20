@@ -38,5 +38,7 @@
                   (:file "crash-recovery"
                    :depends-on ("package"))
                    (:file "bug-report"
+                    :depends-on ("package"))
+                   (:file "collection-edge-cases"
                     :depends-on ("package")))))
   )
