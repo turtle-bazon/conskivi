@@ -9,9 +9,11 @@
 ;;;                 empty although the .ck file contains the data.
 ;;; Bug 2         : index-hgetall returns (value field) pairs instead of
 ;;;                 (field value).
-;;; Bug 3         : "skiplist phantom member after reopen" - NOT reproduced;
-;;;                 the reloaded skiplist contains exactly the stored members
-;;;                 (all scores legitimately decode as float64).
+;;; Bug 3         : "phantom member after reopen". The original non-update
+;;;                 scenario did not reproduce; but updating an existing
+;;;                 member/field left the superseded leaf entry in the B+tree,
+;;;                 so scans (hgetall) and warm-load (build-skiplist-from-btree)
+;;;                 saw duplicates. Covered by bug-3-update-* below.
 
 (in-package :conskivi-fileonly-tests)
 
@@ -136,4 +138,40 @@ fresh-instance restart path."
         (is (= 3 (length pairs)))
         (is (equal '("horse" "sheep" "turtle")
                    (mapcar #'cdr pairs))))
+      (conskivi-stop db2))))
+
+(def-test bug-3-zadd-update-no-duplicate-leaf (:suite bug-report)
+  "Updating a member's score must not leave the old leaf entry behind.
+Regression: index-zadd inserted a new entry without removing the old one,
+so hgetall/zrange and warm-load saw a ghost member at the old score."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-zadd db :scores 1.0 "turtle")
+      (conskivi-zadd db :scores 1.5 "turtle")
+      (conskivi-zadd db :scores 1.0 "horse")
+      (is (= 2 (conskivi-zcard db :scores)))
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      (is (= 2 (conskivi-zcard db2 :scores))
+          "warm-load must not resurrect the superseded score")
+      (let ((pairs (zset-skiplist-pairs db2 :scores)))
+        (is (equal '("horse" "turtle") (mapcar #'cdr pairs)))
+        (is (equal '(1.0d0 1.5d0)
+                   (mapcar (lambda (p) (coerce (car p) 'double-float)) pairs))
+            "turtle must keep only its updated score 1.5"))
+      (conskivi-stop db2))))
+
+(def-test bug-3-hset-update-no-duplicate-leaf (:suite bug-report)
+  "Updating a hash field must not leave the old leaf entry behind."
+  (with-fixture bug-report-db ()
+    (let ((db (make-fresh-db bug-db-path)))
+      (conskivi-hset db :day "turtle" 1)
+      (conskivi-hset db :day "turtle" 2)
+      (conskivi-hset db :day "horse" 1)
+      (is (equal '("horse" 1 "turtle" 2) (conskivi-hgetall db :day))
+          "hgetall must not show the stale turtle field")
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path)))
+      (is (equal '("horse" 1 "turtle" 2) (conskivi-hgetall db2 :day)))
+      (is (equal 2 (conskivi-hget db2 :day "turtle")))
       (conskivi-stop db2))))

@@ -527,8 +527,18 @@
                  (setf (btree-dirty tree) t)
                  ;; Log modified page to WAL
                  (btree-log-page tree page)
-                 (return)))
+                  (return)))
     found))
+
+(defun btree-remove-entry (tree root-page-num key-bytes)
+  "Remove the entry with the given key, descending to its leaf. Returns T if found."
+  (when (= root-page-num 0)
+    (return-from btree-remove-entry nil))
+  (multiple-value-bind (page slot)
+      (btree-find-leaf tree root-page-num key-bytes)
+    (declare (ignore slot))
+    (when page
+      (btree-delete-from-leaf tree page key-bytes))))
 
 ;;; Range scan
 

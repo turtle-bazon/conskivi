@@ -170,8 +170,10 @@
            (root (meta-score-root (btree-meta tree)))
            (existing (btree-lookup-entry tree root field-key-bytes))
            (is-new (not existing)))
-      (let ((value-bytes (encode-value-to-bytes value))
-            (entry-bytes (encode-hash-entry #x01
+      ;; Remove the superseded leaf entry so scans don't see duplicates.
+      (when existing
+        (btree-remove-entry tree root field-key-bytes))
+      (let ((entry-bytes (encode-hash-entry #x01
                                             (value-to-key-bytes field-str)
                                             (encode-value-to-bytes value))))
         (setf (meta-score-root (btree-meta tree))
@@ -284,7 +286,7 @@
            (root (meta-score-root (btree-meta tree)))
            (existing (btree-lookup-entry tree root member-key-bytes)))
       (if existing
-          ;; Update existing - remove old score from skiplist, add new
+          ;; Update existing - remove old score from skiplist and B+tree, add new
           (progn
             ;; Decode old entry to get old score
             (multiple-value-bind (old-status old-score old-member-bytes)
@@ -293,6 +295,9 @@
               ;; Remove old score entry from skiplist
               (let ((old-key (make-zset-key old-score member-key-bytes)))
                 (skiplist-delete (cie-score-tree entry) old-key)))
+            ;; Remove the superseded leaf entry (the B+tree key is the member,
+            ;; so an update would otherwise append a duplicate leaf entry).
+            (btree-remove-entry tree root member-key-bytes)
             ;; Insert new entry into B+tree
             (let ((entry-bytes (encode-zset-leaf-entry #x01 score member-key-bytes)))
               (setf (meta-score-root (btree-meta tree))

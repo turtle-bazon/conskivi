@@ -235,6 +235,9 @@
 (defmethod conskivi-del-impl ((database conskivi-fileonly-database) key)
   (let ((lock (get-key-lock database key)))
     (bt2:with-lock-held (lock)
+      ;; Drop the in-memory collection entry (if any) so collection reads
+      ;; (zrange/hgetall/smembers/...) stop serving the deleted key.
+      (remhash key (get-collection-index database))
       (delete-key-file database key))))
 
 ;;; Key operations
