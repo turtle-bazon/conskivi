@@ -170,7 +170,16 @@
   ;; Truncate file
   (when (probe-file (wal-file-path wal))
     (delete-file (wal-file-path wal)))
-  (setf (wal-entry-count wal) 0))
+  (setf (wal-entry-count wal) 0)
+  ;; Re-open an empty append WAL so subsequent mutations can log.
+  (ensure-directories-exist (wal-file-path wal))
+  (setf (wal-stream wal)
+        (open (wal-file-path wal) :direction :output :if-exists :supersede
+                                  :element-type '(unsigned-byte 8)))
+  (setf (wal-fd wal)
+        (sb-posix:open (namestring (wal-file-path wal))
+                       (logior sb-posix:o-rdwr)
+                       #o644)))
 
 (defun wal-empty-p (wal)
   "Check if WAL is empty."

@@ -227,8 +227,8 @@
               (let ((field (flexi-streams:octets-to-string field-bytes
                                                            :external-format :utf-8))
                     (value (decode-hash-value value-bytes)))
-                (push value result)
-                (push field result)))))))
+                (push field result)
+                (push value result)))))))
     (nreverse result)))
 
 (defun index-hkeys (entry)

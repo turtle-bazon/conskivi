@@ -36,5 +36,7 @@
                   (:file "transaction-operations"
                    :depends-on ("package"))
                   (:file "crash-recovery"
-                   :depends-on ("package")))))
+                   :depends-on ("package"))
+                   (:file "bug-report"
+                    :depends-on ("package")))))
   )

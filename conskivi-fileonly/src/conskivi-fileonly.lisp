@@ -155,7 +155,7 @@
     (let ((header (make-array 13 :element-type '(unsigned-byte 8))))
       (unless (= (read-sequence header stream) 13)
         (return-from load-btree-collection nil))
-      (let ((type-byte (aref header 0)))
+      (let ((type-byte (aref header +meta-offset-type+)))
         (unless (member type-byte (list +type-set+ +type-hash+ +type-zset+))
           (return-from load-btree-collection nil))
         (file-position stream 0)
