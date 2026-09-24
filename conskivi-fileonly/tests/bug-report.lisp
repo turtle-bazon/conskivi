@@ -390,3 +390,49 @@ an empty collection file (plus mmap/WAL) on a read-like op."
       (is (= 0 (conskivi-zrem db :ghost "m")))
       (is (null (conskivi-hdel db :ghost "f")))
       (conskivi-stop db))))
+
+(def-test bug-mixed-case-keys-survive-restart (:suite bug-report)
+  "Programmatically interned mixed-case keys (e.g. POST-<id>) must
+resolve after a restart.
+Regression: warm-load and list-all-keys re-interned keys UPPERCASED,
+so the on-disk data (case-preserved) became unreachable through the
+in-memory index: exists/type (file probe) worked while hgetall/keys
+served NIL/upcased results."
+  (with-fixture bug-report-db ()
+    (let ((post (intern "POST-ft6bmba54irq7phne56udeqyyo" :keyword))
+          (day (intern "DAY-2026-08-05" :keyword))
+          (scores (intern "SCORES-abc123" :keyword))
+          (db (make-fresh-db bug-db-path)))
+      (conskivi-hset db post "field" 1)
+      (conskivi-zadd db scores 2.0 "m")
+      (conskivi-sadd db day "m")
+      (conskivi-put db (intern "STR-AbC" :keyword) "v")
+      (is (equal '("field" 1) (conskivi-hgetall db post)))
+      (conskivi-stop db))
+    (let ((db2 (make-fresh-db bug-db-path))
+          (post (intern "POST-ft6bmba54irq7phne56udeqyyo" :keyword))
+          (day (intern "DAY-2026-08-05" :keyword))
+          (scores (intern "SCORES-abc123" :keyword))
+          (str (intern "STR-AbC" :keyword)))
+      (is (equal '("field" 1) (conskivi-hgetall db2 post))
+          "hash readable through the original mixed-case key")
+      (is (equal 1 (conskivi-hget db2 post "field")))
+      (is (equal '("m" 2.0) (conskivi-zrange db2 scores 0 -1 t)))
+      (is (equal '("m") (conskivi-smembers db2 day)))
+      (is (equal "v" (conskivi-get db2 str)))
+      (is (member post (conskivi-keys db2))
+          "keys preserves exact case")
+      (is (member str (conskivi-keys db2)))
+      ;; Writes through the mixed-case key still land in the same entry.
+      (conskivi-hset db2 post "field2" 2)
+      (is (equal 2 (conskivi-hget db2 post "field2")))
+      ;; Deletion resolves too.
+      (conskivi-del db2 day)
+      (is (null (conskivi-exists db2 day)))
+      (is (null (conskivi-smembers db2 day)))
+      (conskivi-stop db2))
+    (let ((db3 (make-fresh-db bug-db-path))
+          (post (intern "POST-ft6bmba54irq7phne56udeqyyo" :keyword)))
+      (is (equal '("field" 1 "field2" 2) (conskivi-hgetall db3 post))
+          "mixed-case data survives a second restart")
+      (conskivi-stop db3))))

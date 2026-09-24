@@ -88,9 +88,9 @@
       (delete-file path))))
 
 (defun list-all-keys (database)
-  "List all keys in the database directory."
+  "List all keys in the database directory, preserving exact case."
   (let ((db-path (slot-value database 'db-path)))
-    (mapcar (lambda (k) (intern (string-upcase k) :keyword))
+    (mapcar (lambda (k) (intern k :keyword))
             (mapcar #'decode-key-from-file
                     (mapcar (lambda (p) (format nil "~a.~a" (pathname-name p) (pathname-type p)))
                             (directory (merge-pathnames #p"*.ck" db-path)))))))

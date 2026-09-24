@@ -253,7 +253,10 @@ not an existing collection."
     (when (probe-file db-path)
       (dolist (path (directory (merge-pathnames #p"*.ck" db-path)))
         (let* ((name (format nil "~a.~a" (pathname-name path) (pathname-type path)))
-               (key (intern (string-upcase (subseq name 0 (- (length name) 3))) :keyword)))
+               ;; Preserve exact case: keys may be mixed-case keywords
+               ;; (e.g. interned ids); upcasing here orphaned them from
+               ;; the index after every restart.
+               (key (intern (subseq name 0 (- (length name) 3)) :keyword)))
           (load-btree-collection path key index)))))
   (setf (slot-value database 'state) :running)
   (start-expiration-thread database))
